@@ -1,0 +1,32 @@
+name: Email & Calendar Follow-up Checker
+
+on:
+  schedule:
+    # 8:00 AM ET (12:00 UTC) every weekday
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch: # Allow manual runs from GitHub UI
+
+jobs:
+  check-followups:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: Write Google token
+        run: echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
+
+      - name: Run follow-up checker
+        run: python email_calendar_checker.py

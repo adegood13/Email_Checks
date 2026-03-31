@@ -17,5 +17,14 @@ python email_calendar_checker.py
 4. Download the credentials JSON and save as `credentials.json` in this directory
 5. On first run, a browser window will open for OAuth consent. The resulting token is saved as `token.json`
 
-## Scheduled Execution
-This script is scheduled via Claude Code remote trigger to run every weekday morning at 8:00 AM ET.
+## Scheduled Execution (GitHub Actions)
+A GitHub Actions workflow runs this script every weekday at 8:00 AM ET automatically.
+
+### Setup: Add Repository Secrets
+After completing the Google API setup above and running the script once locally to generate `token.json`, add these two secrets in GitHub (Settings > Secrets and variables > Actions):
+
+1. **`GOOGLE_CREDENTIALS`** — Paste the full contents of your `credentials.json` file
+2. **`GOOGLE_TOKEN`** — Paste the full contents of your `token.json` file
+
+### Manual Run
+You can also trigger the workflow manually from the Actions tab in GitHub using the "Run workflow" button.
