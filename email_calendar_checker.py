@@ -50,7 +50,16 @@ def get_credentials():
                 )
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+            try:
+                creds = flow.run_local_server(port=0)
+            except Exception:
+                # Fallback for headless environments
+                flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+                auth_url, _ = flow.authorization_url(prompt="consent")
+                print(f"\nPlease visit this URL to authorize:\n\n{auth_url}\n")
+                code = input("Enter the authorization code: ")
+                flow.fetch_token(code=code)
+                creds = flow.credentials
         with open(TOKEN_PATH, "w") as token_file:
             token_file.write(creds.to_json())
     return creds
