@@ -52,7 +52,7 @@ AUTO_SUBJECT_PATTERNS = [
     r"(welcome\s+to|thanks?\s+for\s+(signing|registering|subscribing|your\s+(order|purchase)))",
     r"(unsubscribe|opt.out)",
     r"(out\s+of\s+office|auto.?reply|automatic\s+reply|ooo)",
-    r"(calendar|invite|invitation)\s*(accept|decline|tentative|update|cancel)",
+    r"(calendar|invit(e|ation))\s*[:.]?\s*(accept|decline|tentative|update|cancel|team|sync|standup|meeting|review)",
     r"(daily|weekly|monthly)\s*(digest|summary|report|update|recap)",
     r"(security\s+alert|login\s+attempt|sign.in\s+attempt)",
 ]
