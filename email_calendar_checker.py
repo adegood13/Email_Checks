@@ -3,8 +3,9 @@
 Email & Calendar Follow-up Checker
 
 Reads Gmail sent emails (past 21 days) and analyzes whether a follow-up is
-actually needed based on the email content. Checks Google Calendar for meetings
-in the past 3 weeks where no follow-up email was sent within 24 hours.
+actually needed based on email content AND recent contact history. Checks
+Google Calendar for meetings where no follow-up occurred within 24 hours.
+Skips people you've been in touch with recently on any channel.
 Emails a summary to andrew@askbobai.com.
 """
 
@@ -35,6 +36,8 @@ RECIPIENT_EMAIL = "andrew@askbobai.com"
 LOOKBACK_DAYS = 21
 FOLLOWUP_GRACE_DAYS = 3
 CALENDAR_FOLLOWUP_HOURS = 24
+# How recently must contact have occurred (on any thread/meeting) to count
+RECENT_CONTACT_DAYS = 5
 
 # Patterns indicating the email is automated / no reply expected
 NOREPLY_PATTERNS = [
@@ -80,7 +83,7 @@ EXPECTING_REPLY_PATTERNS = [
 
 # Patterns suggesting the email is just informational / no reply needed
 NO_REPLY_NEEDED_BODY = [
-    r"^(thanks|thank\s+you|thx|ty)[.!]?\s*$",         # just saying thanks
+    r"^(thanks|thank\s+you|thx|ty)[.!]?\s*$",
     r"^(got\s+it|sounds?\s+good|perfect|great|noted|ack)[.!]?\s*$",
     r"(no\s+(reply|response|action)\s+(needed|required|necessary))",
     r"(fyi|for\s+your\s+(info|information|records?|reference))",
@@ -107,7 +110,6 @@ def get_credentials():
             try:
                 creds = flow.run_local_server(port=0)
             except Exception:
-                # Fallback for headless environments
                 flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
                 auth_url, _ = flow.authorization_url(prompt="consent")
                 print(f"\nPlease visit this URL to authorize:\n\n{auth_url}\n")
@@ -137,33 +139,29 @@ def get_message_body(message):
     """Extract plain text body from a Gmail message."""
     payload = message.get("payload", {})
 
-    # Simple single-part message
     if payload.get("mimeType", "").startswith("text/plain"):
         data = payload.get("body", {}).get("data", "")
         if data:
             return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
 
-    # Multipart message — find text/plain part
     parts = payload.get("parts", [])
     for part in parts:
         if part.get("mimeType") == "text/plain":
             data = part.get("body", {}).get("data", "")
             if data:
                 return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-        # Check nested parts (e.g. multipart/alternative inside multipart/mixed)
         for subpart in part.get("parts", []):
             if subpart.get("mimeType") == "text/plain":
                 data = subpart.get("body", {}).get("data", "")
                 if data:
                     return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
 
-    # Fallback: try text/html
     for part in parts:
         if part.get("mimeType") == "text/html":
             data = part.get("body", {}).get("data", "")
             if data:
                 html = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-                return re.sub(r"<[^>]+>", " ", html)  # crude HTML strip
+                return re.sub(r"<[^>]+>", " ", html)
 
     return ""
 
@@ -193,13 +191,12 @@ def email_needs_followup(subject, body):
     body_lower = body.lower().strip()
     body_lines = [line.strip() for line in body_lower.split("\n") if line.strip()]
 
-    # Check if the body is just a short acknowledgment (no reply expected)
     short_body = " ".join(body_lines[:3]) if body_lines else ""
     for pattern in NO_REPLY_NEEDED_BODY:
         if re.search(pattern, short_body, re.IGNORECASE | re.MULTILINE):
             return False, ""
 
-    # Strip quoted text (lines starting with >) and signature
+    # Strip quoted text and signature
     original_lines = []
     for line in body_lines:
         if line.startswith(">") or line.startswith("on ") and "wrote:" in line:
@@ -212,7 +209,6 @@ def email_needs_followup(subject, body):
     if not original_text:
         return False, ""
 
-    # Score the email for whether a reply is expected
     reasons = []
     for pattern in EXPECTING_REPLY_PATTERNS:
         if re.search(pattern, original_text, re.IGNORECASE):
@@ -220,7 +216,6 @@ def email_needs_followup(subject, body):
             reasons.append(match.group(0).strip())
 
     if reasons:
-        # Deduplicate and pick the top reason
         unique = list(dict.fromkeys(reasons))
         reason_str = unique[0]
         if "?" in reason_str:
@@ -250,11 +245,92 @@ def email_needs_followup(subject, body):
     return False, ""
 
 
-def find_unreplied_sent_emails(gmail_service, my_email):
+def build_recent_contacts(gmail_service, calendar_service, my_email):
     """
-    Find emails sent in the past 21 days where no one has replied,
-    the content suggests a reply was expected, and the user hasn't
-    already followed up in the past 3 days.
+    Build a set of email addresses you've had recent contact with across
+    ALL channels: emails they sent you, emails you sent them (on any thread),
+    and calendar meetings you both attended.
+
+    Returns a dict of {email_address: last_contact_description}.
+    """
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now - timedelta(days=RECENT_CONTACT_DAYS)
+    recent_cutoff_str = recent_cutoff.strftime("%Y/%m/%d")
+
+    recent = {}  # email -> description of last contact
+
+    # 1) People who emailed me recently (inbox, any thread)
+    print("  Building recent contacts: checking incoming emails...")
+    query = f"in:inbox after:{recent_cutoff_str}"
+    results = gmail_service.users().messages().list(
+        userId="me", q=query, maxResults=500
+    ).execute()
+    for msg_info in results.get("messages", []):
+        msg = gmail_service.users().messages().get(
+            userId="me", id=msg_info["id"], format="metadata",
+            metadataHeaders=["From"]
+        ).execute()
+        headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
+        from_addr = extract_email_address(headers.get("from", ""))
+        if from_addr and from_addr != my_email.lower():
+            if from_addr not in recent:
+                recent[from_addr] = "They emailed you recently"
+
+    # 2) People I emailed recently (on any thread, not just the flagged one)
+    print("  Building recent contacts: checking outgoing emails...")
+    query = f"in:sent after:{recent_cutoff_str}"
+    results = gmail_service.users().messages().list(
+        userId="me", q=query, maxResults=500
+    ).execute()
+    for msg_info in results.get("messages", []):
+        msg = gmail_service.users().messages().get(
+            userId="me", id=msg_info["id"], format="metadata",
+            metadataHeaders=["To", "Cc"]
+        ).execute()
+        headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
+        for field in ["to", "cc"]:
+            for addr in headers.get(field, "").split(","):
+                email_addr = extract_email_address(addr)
+                if email_addr and email_addr != my_email.lower():
+                    if email_addr not in recent:
+                        recent[email_addr] = "You emailed them recently (other thread)"
+
+    # 3) People I've had calendar meetings with recently
+    print("  Building recent contacts: checking recent meetings...")
+    events_result = calendar_service.events().list(
+        calendarId="primary",
+        timeMin=recent_cutoff.isoformat(),
+        timeMax=now.isoformat(),
+        maxResults=100,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+    for event in events_result.get("items", []):
+        if event.get("status") == "cancelled":
+            continue
+        # Skip events I declined
+        for a in event.get("attendees", []):
+            if a.get("self") and a.get("responseStatus") == "declined":
+                break
+        else:
+            summary = event.get("summary", "a meeting")
+            for a in event.get("attendees", []):
+                email_addr = a.get("email", "").lower()
+                if email_addr and email_addr != my_email.lower() and not a.get("resource", False):
+                    if email_addr not in recent:
+                        recent[email_addr] = f"Met in \"{summary}\" recently"
+
+    print(f"  Found {len(recent)} recent contacts across all channels")
+    return recent
+
+
+def find_unreplied_sent_emails(gmail_service, my_email, recent_contacts):
+    """
+    Find emails sent in the past 21 days where:
+    - No one has replied on that thread
+    - The email content suggests a reply was expected
+    - The user hasn't already followed up in the past 3 days
+    - The recipient hasn't been in touch on ANY other channel recently
     """
     now = datetime.now(timezone.utc)
     lookback_date = now - timedelta(days=LOOKBACK_DAYS)
@@ -277,7 +353,6 @@ def find_unreplied_sent_emails(gmail_service, my_email):
             continue
         seen_threads.add(thread_id)
 
-        # Fetch full thread to read message bodies
         thread = gmail_service.users().threads().get(
             userId="me", id=thread_id, format="full"
         ).execute()
@@ -345,10 +420,24 @@ def find_unreplied_sent_emails(gmail_service, my_email):
         if not needs_followup:
             continue
 
+        # Check if ALL recipients have been in recent contact on other channels
+        # If every recipient is someone you've recently touched base with, skip
+        recipients_with_recent_contact = []
+        recipients_without_contact = []
+        for r in recipients:
+            if r in recent_contacts:
+                recipients_with_recent_contact.append((r, recent_contacts[r]))
+            else:
+                recipients_without_contact.append(r)
+
+        if not recipients_without_contact:
+            # Everyone on this email has been in touch recently — skip
+            continue
+
         days_waiting = (now - last_sent_date).days
         unreplied.append({
             "subject": subject,
-            "recipients": ", ".join(recipients) if recipients else "unknown",
+            "recipients": ", ".join(recipients_without_contact),
             "sent_date": last_sent_date.strftime("%b %d, %Y"),
             "days_waiting": days_waiting,
             "reason": reason,
@@ -357,10 +446,12 @@ def find_unreplied_sent_emails(gmail_service, my_email):
     return unreplied
 
 
-def find_meetings_without_followup(gmail_service, calendar_service, my_email):
+def find_meetings_without_followup(gmail_service, calendar_service, my_email,
+                                   recent_contacts):
     """
     Find calendar meetings from the past 3 weeks where no follow-up email
-    was sent to any attendee within 24 hours of the meeting.
+    was sent to any attendee within 24 hours of the meeting AND you haven't
+    been in contact with any attendee recently on other threads/meetings.
     """
     now = datetime.now(timezone.utc)
     lookback_date = now - timedelta(days=LOOKBACK_DAYS)
@@ -384,11 +475,10 @@ def find_meetings_without_followup(gmail_service, calendar_service, my_email):
 
         start = event["start"].get("dateTime")
         if not start:
-            continue  # skip all-day events
+            continue
 
         summary = event.get("summary", "(no title)")
 
-        # Skip events the user declined
         attendees = event.get("attendees", [])
         my_status = None
         for a in attendees:
@@ -414,7 +504,7 @@ def find_meetings_without_followup(gmail_service, calendar_service, my_email):
         if event_time > followup_threshold:
             continue
 
-        # Check if a follow-up email was sent to ANY attendee after the meeting
+        # Check if you've emailed ANY attendee after the meeting (on any thread)
         has_followup = False
         meeting_date_str = event_time.strftime("%Y/%m/%d")
 
@@ -423,25 +513,48 @@ def find_meetings_without_followup(gmail_service, calendar_service, my_email):
             results = gmail_service.users().messages().list(
                 userId="me", q=query, maxResults=5
             ).execute()
-
             if results.get("messages"):
                 has_followup = True
                 break
 
-        if not has_followup:
-            hours_since = int((now - event_time).total_seconds() / 3600)
-            if hours_since < 48:
-                time_label = f"{hours_since} hours ago"
-            else:
-                time_label = f"{hours_since // 24} days ago"
+        if has_followup:
+            continue
 
-            missing_followups.append({
-                "meeting": summary,
-                "date": event_time.strftime("%b %d, %Y at %I:%M %p"),
-                "attendees": ", ".join(other_attendees[:5]),
-                "time_label": time_label,
-                "hours_since": hours_since,
-            })
+        # Check if ANY attendee has been in recent contact (other emails, other meetings)
+        # If you've been in touch with at least one key attendee, skip
+        all_in_recent_contact = all(
+            a in recent_contacts for a in other_attendees
+        )
+        any_in_recent_contact = any(
+            a in recent_contacts for a in other_attendees
+        )
+
+        # If every attendee is someone you've recently been in touch with
+        # via other channels, this meeting doesn't need a separate follow-up
+        if all_in_recent_contact:
+            continue
+
+        # If you've been in touch with at least one attendee recently AND
+        # the meeting had multiple attendees, likely covered via that contact
+        if any_in_recent_contact and len(other_attendees) > 1:
+            continue
+
+        hours_since = int((now - event_time).total_seconds() / 3600)
+        if hours_since < 48:
+            time_label = f"{hours_since} hours ago"
+        else:
+            time_label = f"{hours_since // 24} days ago"
+
+        # Only include attendees you HAVEN'T been in touch with
+        stale_attendees = [a for a in other_attendees if a not in recent_contacts]
+
+        missing_followups.append({
+            "meeting": summary,
+            "date": event_time.strftime("%b %d, %Y at %I:%M %p"),
+            "attendees": ", ".join(stale_attendees[:5]),
+            "time_label": time_label,
+            "hours_since": hours_since,
+        })
 
     return missing_followups
 
@@ -473,7 +586,7 @@ def build_email_body(unreplied_emails, missing_followups):
         for item in sorted(missing_followups, key=lambda x: x["hours_since"], reverse=True):
             lines.append(f"  Meeting: {item['meeting']}")
             lines.append(f"  Date: {item['date']} ({item['time_label']})")
-            lines.append(f"  Attendees: {item['attendees']}")
+            lines.append(f"  Contact: {item['attendees']}")
             lines.append("")
     else:
         lines.append("MEETINGS NEEDING FOLLOW-UP: None - you're all caught up!")
@@ -503,15 +616,22 @@ def main():
     my_email = get_my_email(gmail_service)
     print(f"Authenticated as: {my_email}")
 
+    # Build a map of everyone you've been in contact with recently
+    # across all channels (other email threads, calendar meetings)
+    print("Building recent contact history (past 5 days)...")
+    recent_contacts = build_recent_contacts(
+        gmail_service, calendar_service, my_email
+    )
+
     print("Checking for unreplied sent emails (past 21 days)...")
-    unreplied = find_unreplied_sent_emails(gmail_service, my_email)
-    print(f"  Found {len(unreplied)} emails needing follow-up")
+    unreplied = find_unreplied_sent_emails(gmail_service, my_email, recent_contacts)
+    print(f"  Found {len(unreplied)} emails truly needing follow-up")
 
     print("Checking calendar meetings for missing follow-ups...")
     missing_followups = find_meetings_without_followup(
-        gmail_service, calendar_service, my_email
+        gmail_service, calendar_service, my_email, recent_contacts
     )
-    print(f"  Found {len(missing_followups)} meetings without follow-up")
+    print(f"  Found {len(missing_followups)} meetings truly needing follow-up")
 
     body = build_email_body(unreplied, missing_followups)
     today_str = datetime.now().strftime("%b %d, %Y")
